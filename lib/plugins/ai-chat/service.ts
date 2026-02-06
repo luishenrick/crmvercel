@@ -1,0 +1,218 @@
+import { db } from '@/lib/db/drizzle';
+import { aiConfigs, aiSessions, chats, messages, evolutionInstances } from '@/lib/db/schema';
+import { eq, and } from 'drizzle-orm';
+import { OpenAIProvider } from './providers/openai';
+import { GeminiProvider } from './providers/gemini';
+import { getDynamicTools } from './tools';
+import { AIMessage, AIProvider } from './types';
+import { pusherServer } from '@/lib/pusher-server';
+
+const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL || "http://localhost:8080";
+
+async function sendAiTextMessage(instance: any, remoteJid: string, text: string, teamId: number, chatId: number) {
+    if (!instance.accessToken) return;
+
+    const cleanText = text.replace(/\[SYSTEM_INSTRUCTION\]/g, '').replace(/Output EXACTLY this text: "/g, '').replace(/"$/g, '').trim();
+
+    const payload = {
+        number: remoteJid.replace(/\D/g, ''),
+        text: cleanText,
+        delay: 1000,
+        linkPreview: true
+    };
+
+    try {
+        const response = await fetch(`${EVOLUTION_API_URL}/message/sendText/${instance.instanceName}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'apikey': instance.accessToken },
+            body: JSON.stringify(payload)
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data?.key?.id) {
+            const messageId = data.key.id;
+            const timestamp = new Date();
+            
+            const newMessage = {
+                id: messageId, 
+                chatId: chatId, 
+                fromMe: true, 
+                messageType: 'conversation', 
+                text: cleanText, 
+                timestamp, 
+                status: 'sent' as const, 
+                isInternal: false,
+                isAi: true, 
+                quotedMessageText: null
+            };
+
+            await db.insert(messages).values(newMessage).onConflictDoNothing();
+
+            await db.update(chats).set({ 
+                lastMessageText: cleanText, 
+                lastMessageTimestamp: timestamp, 
+                lastMessageFromMe: true, 
+                lastMessageStatus: 'sent' 
+            }).where(eq(chats.id, chatId));
+
+            const pusherChannel = `team-${teamId}`;
+            await pusherServer.trigger(pusherChannel, 'new-message', { 
+                ...newMessage,
+                timestamp: timestamp.toISOString(),
+                remoteJid, 
+                instance: instance.instanceName,
+            });
+            
+            await pusherServer.trigger(pusherChannel, 'chat-list-update', { 
+                id: chatId, 
+                lastMessageText: cleanText, 
+                lastMessageTimestamp: timestamp.toISOString(), 
+                lastMessageFromMe: true, 
+                lastMessageStatus: 'sent', 
+                remoteJid 
+            });
+        }
+    } catch (e) {
+        console.error("Error sending AI text", e);
+    }
+}
+
+export async function processAIMessage(
+  teamId: number,
+  chatId: number,
+  userMessage: string,
+  audioUrl?: string | null
+) {
+
+  await new Promise(resolve => setTimeout(resolve, 1500));
+
+  const config = await db.query.aiConfigs.findFirst({
+    where: and(eq(aiConfigs.teamId, teamId), eq(aiConfigs.isActive, true))
+  });
+
+  if (!config) return false;
+
+  let session = await db.query.aiSessions.findFirst({
+    where: eq(aiSessions.chatId, chatId)
+  });
+
+  if (!session) {
+    const [newSession] = await db.insert(aiSessions).values({
+        chatId,
+        history: [],
+        status: 'active'
+    }).returning();
+    session = newSession;
+  }
+
+  if (session.status !== 'active') {
+      return false;
+  }
+
+  let provider: AIProvider;
+  const commonConfig = {
+    apiKey: config.apiKey, 
+    model: config.model,
+    systemPrompt: config.systemPrompt || undefined,
+    temperature: Number(config.temperature) || 0.7,
+    maxOutputTokens: config.maxOutputTokens || 1000,
+  };
+  
+  if (config.provider === 'openai') {
+    provider = new OpenAIProvider(commonConfig);
+  } else if (config.provider === 'gemini') {
+    provider = new GeminiProvider(commonConfig);
+  } else {
+    throw new Error(`Provider ${config.provider} not implemented yet`);
+  }
+
+  let finalInput = userMessage;
+  if (config.provider === 'openai' && audioUrl) {
+      try {
+          const transcription = await provider.transcribeAudio(audioUrl);
+          if (transcription) {
+             finalInput = `[Audio Transcription]: ${transcription}`;
+             audioUrl = null; 
+          }
+      } catch (e) {
+          console.error("[Service] OpenAI Transcription failed", e);
+      }
+  }
+
+  const history = (session.history as AIMessage[]) || [];
+  
+  if (history.length === 0 && config.systemPrompt && config.provider === 'openai') {
+      history.push({ role: 'system', content: config.systemPrompt });
+  }
+
+  const contentPayload = finalInput || (audioUrl ? "Please listen to this audio and execute any commands requested in it." : "");
+
+  history.push({ 
+      role: 'user', 
+      content: contentPayload,
+      audioUrl: audioUrl 
+  });
+
+  const teamTools = await getDynamicTools(teamId);
+
+  let keepProcessing = true;
+  let finalResponseText = '';
+  let loopCount = 0;
+  const MAX_LOOPS = 5;
+
+  while (keepProcessing && loopCount < MAX_LOOPS) {
+      loopCount++;
+      
+      const response = await provider.generateResponse(history, teamTools);
+      history.push(response);
+
+      if (response.toolCalls && response.toolCalls.length > 0) {
+          for (const toolCall of response.toolCalls) {
+              const toolName = toolCall.function.name;
+              const tool = teamTools.find(t => t.name === toolName);
+              
+              if (tool) {
+                  try {
+                    const args = JSON.parse(toolCall.function.arguments);
+                    const result = await tool.execute(args, { chatId, teamId });
+                    
+                    if (tool.name === 'handover_to_human') {
+                        await db.update(aiSessions).set({ status: 'paused' }).where(eq(aiSessions.id, session.id));
+                        await pusherServer.trigger(`team-${teamId}`, 'chat-status-update', {
+                            chatId, type: 'ai', status: 'paused'
+                        });
+                    }
+
+                    history.push({
+                        role: 'tool',
+                        content: JSON.stringify(result),
+                        toolCallId: toolCall.id || toolCall.function.name
+                    });
+                  } catch (toolError: any) {
+                    console.error(`Tool execution error:`, toolError);
+                    history.push({
+                        role: 'tool',
+                        content: JSON.stringify({ error: toolError.message || "Failed to execute tool" }),
+                        toolCallId: toolCall.id || toolCall.function.name
+                    });
+                  }
+              } else {
+                  history.push({
+                        role: 'tool',
+                        content: JSON.stringify({ error: "Tool not found" }),
+                        toolCallId: toolCall.id || toolCall.function.name
+                    });
+              }
+          }
+      } else {
+          finalResponseText = response.content || '';
+          keepProcessing = false;
+      }
+  }
+
+  const truncatedHistory = history.slice(-20);
+  await db.update(aiSessions).set({ history: truncatedHistory, updatedAt: new Date() }).where(eq(aiSessions.id, session.id));
+
+  return finalResponseText.replace(/\[SYSTEM_INSTRUCTION\]/g, '').replace(/Output EXACTLY this text: "/g, '').replace(/"$/g, '').trim();
+}

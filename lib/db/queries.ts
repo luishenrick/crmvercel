@@ -10,7 +10,12 @@ export async function getUser() {
     return null;
   }
 
-  const sessionData = await verifyToken(sessionCookie.value);
+  let sessionData;
+  try {
+    sessionData = await verifyToken(sessionCookie.value);
+  } catch (error) {
+    return null;
+  }
   if (
     !sessionData ||
     !sessionData.user ||

@@ -28,17 +28,22 @@ export async function getUser() {
     return null;
   }
 
-  const user = await db
-    .select()
-    .from(users)
-    .where(and(eq(users.id, sessionData.user.id), isNull(users.deletedAt)))
-    .limit(1);
+  try {
+    const user = await db
+      .select()
+      .from(users)
+      .where(and(eq(users.id, sessionData.user.id), isNull(users.deletedAt)))
+      .limit(1);
 
-  if (user.length === 0) {
+    if (user.length === 0) {
+      return null;
+    }
+
+    return user[0];
+  } catch (error) {
+    console.error('Failed to fetch user:', error);
     return null;
   }
-
-  return user[0];
 }
 
 export async function getPublishedPlans() {

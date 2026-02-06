@@ -149,27 +149,33 @@ export async function getTeamForUser() {
   }
 
 
-  const result = await db.query.teamMembers.findFirst({
-    where: eq(teamMembers.userId, user.id),
-    with: {
-      team: {
-        with: {
-          teamMembers: {
-            with: {
-              user: {
-                columns: {
-                  id: true,
-                  name: true,
-                  email: true
+  let result;
+  try {
+    result = await db.query.teamMembers.findFirst({
+      where: eq(teamMembers.userId, user.id),
+      with: {
+        team: {
+          with: {
+            teamMembers: {
+              with: {
+                user: {
+                  columns: {
+                    id: true,
+                    name: true,
+                    email: true
+                  }
                 }
               }
-            }
-          },
-          evolutionInstances: true
+            },
+            evolutionInstances: true
+          }
         }
       }
-    }
-  });
+    });
+  } catch (error) {
+    console.error('Failed to fetch team for user:', error);
+    return null;
+  }
 
   return result?.team || null;
 }

@@ -47,7 +47,12 @@ export async function getUser() {
 }
 
 export async function getPublishedPlans() {
-  return await db.select().from(plans).orderBy(plans.amount);
+  try {
+    return await db.select().from(plans).orderBy(plans.amount);
+  } catch (error) {
+    console.error('Failed to fetch published plans:', error);
+    return [];
+  }
 }
 
 export async function getTeamByStripeCustomerId(customerId: string) {
